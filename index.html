@@ -89,6 +89,7 @@
   <div id="ui">
     <span>方向鍵 / WASD 移動 &nbsp;·&nbsp; 空格 / Z 射擊</span>
     <span id="scoreDisplay">得分: 0 &nbsp; 生命: ❤❤❤</span>
+    <button id="soundBtn">🔊 音效開</button>
     <button id="startBtn">開始遊戲</button>
   </div>
 </div>
@@ -109,6 +110,117 @@ let shootCooldown = 0;
 let touchStart = null;
 const keys = {};
 
+/* ===== 8-bit 音效與背景音樂引擎（Web Audio API，純合成，無外部檔案） ===== */
+let audioCtx = null, masterGain = null, musicGain = null, sfxGain = null;
+let soundOn = true;
+let musicTimer = null, musicStep = 0, nextNoteTime = 0;
+
+function ensureAudio() {
+  if(audioCtx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  audioCtx = new AC();
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = soundOn ? 0.5 : 0;
+  masterGain.connect(audioCtx.destination);
+  musicGain = audioCtx.createGain();
+  musicGain.gain.value = 0.6;
+  musicGain.connect(masterGain);
+  sfxGain = audioCtx.createGain();
+  sfxGain.gain.value = 0.9;
+  sfxGain.connect(masterGain);
+}
+
+function midiToFreq(m) { return 440 * Math.pow(2, (m-69)/12); }
+
+// 在指定時間 when 播放一個合成音（方波/三角波等）
+function tone(when, freq, dur, type, dest, vol, slideTo) {
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, when);
+  if(slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, when+dur);
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.exponentialRampToValueAtTime(vol, when+0.008);
+  g.gain.exponentialRampToValueAtTime(0.0001, when+dur);
+  osc.connect(g); g.connect(dest);
+  osc.start(when); osc.stop(when+dur+0.02);
+}
+
+// 噪音爆裂（用於爆炸、hi-hat）
+function noiseAt(when, dur, vol, freq, dest) {
+  const n = Math.max(1, Math.floor(audioCtx.sampleRate*dur));
+  const buf = audioCtx.createBuffer(1, n, audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<n;i++) d[i] = Math.random()*2-1;
+  const src = audioCtx.createBufferSource(); src.buffer = buf;
+  const lp = audioCtx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = freq;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, when);
+  g.gain.exponentialRampToValueAtTime(0.0001, when+dur);
+  src.connect(lp); lp.connect(g); g.connect(dest);
+  src.start(when); src.stop(when+dur);
+}
+
+function playSFX(kind) {
+  if(!soundOn || !audioCtx) return;
+  const t = audioCtx.currentTime;
+  if(kind === 'shoot') tone(t, 880, 0.08, 'square', sfxGain, 0.10, 330);
+  else if(kind === 'explosion') noiseAt(t, 0.25, 0.22, 900, sfxGain);
+  else if(kind === 'hit') tone(t, 330, 0.28, 'sawtooth', sfxGain, 0.16, 70);
+  else if(kind === 'shield') tone(t, 440, 0.18, 'triangle', sfxGain, 0.14, 880);
+  else if(kind === 'powerup') [72,76,79,84].forEach((m,k) => tone(t+k*0.06, midiToFreq(m), 0.09, 'square', sfxGain, 0.11));
+  else if(kind === 'boss') noiseAt(t, 0.5, 0.28, 600, sfxGain);
+}
+
+// 背景音樂：Am → F → C → G 循環琶音
+const LEAD = [
+  69,72,76,72, 69,72,76,72,
+  65,69,72,69, 65,69,72,69,
+  72,76,79,76, 72,76,79,76,
+  67,71,74,71, 67,71,74,71
+];
+const BASSROOT = [45, 41, 48, 43];
+const STEP_DUR = 0.16;
+
+function scheduleMusic() {
+  if(!audioCtx) return;
+  while(nextNoteTime < audioCtx.currentTime + 0.25) {
+    const i = musicStep % 32;
+    const bar = Math.floor(i/8);
+    const posInBar = i % 8;
+    tone(nextNoteTime, midiToFreq(LEAD[i]), STEP_DUR*0.9, 'square', musicGain, 0.05);
+    if(posInBar % 2 === 0) tone(nextNoteTime, midiToFreq(BASSROOT[bar]), STEP_DUR*1.6, 'triangle', musicGain, 0.10);
+    else noiseAt(nextNoteTime, 0.03, 0.02, 6000, musicGain);
+    nextNoteTime += STEP_DUR;
+    musicStep++;
+  }
+}
+
+function startMusic() {
+  if(!audioCtx || musicTimer) return;
+  musicStep = 0;
+  nextNoteTime = audioCtx.currentTime + 0.1;
+  musicTimer = setInterval(scheduleMusic, 50);
+}
+
+function stopMusic() {
+  if(musicTimer) { clearInterval(musicTimer); musicTimer = null; }
+}
+
+function gameOverJingle() {
+  if(!soundOn || !audioCtx) return;
+  const t = audioCtx.currentTime;
+  [72,69,65,60].forEach((m,k) => tone(t+k*0.14, midiToFreq(m), 0.16, 'square', sfxGain, 0.12));
+}
+
+function toggleSound() {
+  soundOn = !soundOn;
+  if(masterGain) masterGain.gain.value = soundOn ? 0.5 : 0;
+  if(soundOn && audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  const btn = document.getElementById('soundBtn');
+  if(btn) btn.textContent = soundOn ? '🔊 音效開' : '🔇 音效關';
+}
+
 function init() {
   score = 0; lives = 3; frame = 0; level = 1;
   player = { x:80, y:H/2, w:36, h:20, speed:3.5, shield:0, laser:0, multi:1, invincible:0 };
@@ -126,7 +238,13 @@ function updateUI() {
     `得分: ${score}   生命: ${'❤'.repeat(Math.max(0,lives))}`;
 }
 
-document.getElementById('startBtn').onclick = () => { init(); };
+document.getElementById('startBtn').onclick = () => {
+  ensureAudio();
+  if(audioCtx.state === 'suspended') audioCtx.resume();
+  init();
+  startMusic();
+};
+document.getElementById('soundBtn').onclick = () => { ensureAudio(); toggleSound(); };
 document.addEventListener('keydown', e => {
   keys[e.code] = true;
   if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
@@ -287,15 +405,17 @@ function hitPlayer() {
   if(player.shield > 0) {
     player.shield = 0;
     player.invincible = 60;
+    playSFX('shield');
     spawnParticles(player.x+player.w/2, player.y+player.h/2, '#44ff88', 14);
     return;
   }
   lives--;
   player.invincible = 90;
   player.laser = 0; player.multi = 1;
+  playSFX('hit');
   spawnParticles(player.x+player.w/2, player.y+player.h/2, '#ff6644', 20);
   updateUI();
-  if(lives <= 0) state = 'gameover';
+  if(lives <= 0) { state = 'gameover'; stopMusic(); gameOverJingle(); }
 }
 
 function gameLoop() {
@@ -322,6 +442,7 @@ function gameLoop() {
   if(shootCooldown > 0) shootCooldown--;
   if((keys['Space']||keys['KeyZ']) && shootCooldown === 0) {
     shootCooldown = player.laser ? 6 : 12;
+    playSFX('shoot');
     const offsets = player.multi === 3 ? [-8,0,8] : player.multi === 2 ? [-5,5] : [0];
     offsets.forEach(oy => {
       bullets.push({
@@ -376,6 +497,7 @@ function gameLoop() {
         if(e.hp <= 0) {
           e.dead = true;
           score += e.type==='boss'?500 : e.type==='tank'?30 : e.type==='gunner'?25 : 15;
+          playSFX(e.type==='boss' ? 'boss' : 'explosion');
           spawnParticles(e.x+e.w/2, e.y+e.h/2, e.color, e.type==='boss'?40:14);
           maybeDropPowerup(e.x+e.w/2, e.y+e.h/2);
           updateUI();
@@ -405,6 +527,7 @@ function gameLoop() {
       else if(p.type === 'multi') player.multi = Math.min(3, player.multi+1);
       else if(p.type === 'shield') player.shield = 1;
       else if(p.type === 'life') { lives++; updateUI(); }
+      playSFX('powerup');
       spawnParticles(player.x+player.w/2, player.y+player.h/2, '#ffffff', 10);
     }
   });
